@@ -1,0 +1,15 @@
+{
+  "name": "debatia-backend",
+  "version": "1.0.0",
+  "description": "Serveur socket.io des salles de debat DebatIA",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  }
+}
