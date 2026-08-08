@@ -1,162 +1,332 @@
 /**
- * DebatIA — Serveur de salles de débat (socket.io)
- * Prêt pour Railway · Node 20+
- *
- * Déploiement :
- *   npm install
- *   npm start
- *
- * Railway injecte la variable PORT automatiquement.
+ * DebatIA — Backend de débat vocal multijoueur
+ * Node.js + Express + Socket.io
+ * Déployable tel quel sur Railway.
  */
 
+const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 3000;
 const MAX_JOUEURS = 10;
+const MIN_JOUEURS = 2;
 
-/* ── Serveur HTTP minimal (healthcheck Railway) ─────────────── */
+/* ═══════════════════════════════════════════════════════════
+   ÉTAT EN MÉMOIRE
+   ═══════════════════════════════════════════════════════════ */
 
-const app = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        service: 'debatia-backend',
-        status: 'ok',
-        salles: salles.size,
-        uptime: Math.round(process.uptime()),
-      })
-    );
-    return;
+// salles : Map<roomId, { players: Map<socketId, joueur>, arguments: [], createdAt }>
+const salles = new Map();
+
+function getSalle(roomId) {
+  if (!salles.has(roomId)) {
+    salles.set(roomId, { players: new Map(), arguments: [], createdAt: Date.now() });
   }
-  res.writeHead(404);
-  res.end();
+  return salles.get(roomId);
+}
+
+function listeJoueurs(roomId) {
+  const salle = salles.get(roomId);
+  if (!salle) return [];
+  return Array.from(salle.players.values());
+}
+
+function diffuserSalle(io, roomId) {
+  const players = listeJoueurs(roomId);
+  io.to(roomId).emit('room-update', {
+    roomId,
+    players,
+    count: players.length,
+    max: MAX_JOUEURS,
+    ready: players.length >= MIN_JOUEURS,
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SIMULATION IA (à remplacer par un vrai modèle plus tard)
+   ═══════════════════════════════════════════════════════════ */
+
+const TRANSCRIPTIONS = [
+  "Les faits ne se plient pas à ton opinion, ils la contredisent.",
+  "Tu confonds corrélation et causalité depuis le début.",
+  "Si ta logique tenait, la conclusion inverse serait tout aussi vraie.",
+  "Trois sources indépendantes disent l'exact opposé de ton point.",
+  "Tu déplaces le sujet parce que tu ne peux pas défendre le premier.",
+  "Ton exemple est une exception, pas une règle.",
+  "Aucune de tes prémisses ne survit à un examen sérieux.",
+];
+
+const MOTIFS_VERDICT = [
+  "argumentation la plus structurée",
+  "meilleure maîtrise des faits",
+  "raisonnement le moins contredit",
+  "position la plus difficile à réfuter",
+];
+
+function transcrire() {
+  return TRANSCRIPTIONS[Math.floor(Math.random() * TRANSCRIPTIONS.length)];
+}
+
+function rendreVerdict(roomId) {
+  const salle = salles.get(roomId);
+  if (!salle) return null;
+
+  // Compte les arguments par joueur
+  const scores = {};
+  for (const arg of salle.arguments) {
+    scores[arg.player] = (scores[arg.player] || 0) + 1;
+  }
+
+  const classement = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  if (classement.length === 0) return null;
+
+  const [gagnant, total] = classement[0];
+  const motif = MOTIFS_VERDICT[Math.floor(Math.random() * MOTIFS_VERDICT.length)];
+
+  return {
+    winner: gagnant,
+    reason: `${gagnant} l'emporte : ${motif}.`,
+    scores: classement.map(([name, count]) => ({ name, count })),
+    totalArguments: salle.arguments.length,
+    at: Date.now(),
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SERVEUR HTTP + EXPRESS
+   ═══════════════════════════════════════════════════════════ */
+
+const app = express();
+app.use(express.json());
+
+app.get('/', (req, res) => {
+  res.json({
+    service: 'debatia-backend',
+    status: 'ok',
+    salles: salles.size,
+    uptime: Math.round(process.uptime()),
+  });
 });
 
-/* ── Socket.io ──────────────────────────────────────────────── */
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-const io = new Server(app, {
+app.get('/rooms/:roomId', (req, res) => {
+  const roomId = String(req.params.roomId).toLowerCase();
+  const salle = salles.get(roomId);
+  if (!salle) return res.status(404).json({ error: 'Salle introuvable.' });
+  res.json({
+    roomId,
+    players: listeJoueurs(roomId),
+    arguments: salle.arguments.length,
+  });
+});
+
+const server = http.createServer(app);
+
+/* ═══════════════════════════════════════════════════════════
+   SOCKET.IO
+   ═══════════════════════════════════════════════════════════ */
+
+const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
   pingTimeout: 25000,
   pingInterval: 10000,
 });
 
-// salles : Map<nomSalle, Map<socketId, { id, name }>>
-const salles = new Map();
+function quitterSalle(socket) {
+  const { roomId, playerName } = socket.data;
+  if (!roomId) return;
 
-function membres(room) {
-  return Array.from(salles.get(room)?.values() ?? []);
-}
-
-function diffuserSalle(room) {
-  io.to(room).emit('room-update', { room, users: membres(room) });
-}
-
-function retirer(socket) {
-  const { room, name } = socket.data;
-  if (!room) return;
-
-  const salle = salles.get(room);
+  const salle = salles.get(roomId);
   if (!salle) return;
 
-  salle.delete(socket.id);
-  socket.leave(room);
+  salle.players.delete(socket.id);
+  socket.leave(roomId);
 
-  if (salle.size === 0) {
-    salles.delete(room);
-    console.log(`[salle vide] ${room} — supprimée`);
+  if (salle.players.size === 0) {
+    salles.delete(roomId);
+    console.log(`[salle] ${roomId} vide — supprimée`);
   } else {
-    diffuserSalle(room);
-    console.log(`[sortie] ${name} quitte ${room} (${salle.size} restants)`);
+    diffuserSalle(io, roomId);
+    console.log(`[sortie] ${playerName} quitte ${roomId}`);
   }
 
-  socket.data.room = null;
+  socket.data.roomId = null;
 }
 
 io.on('connection', (socket) => {
   console.log(`[connexion] ${socket.id}`);
+  socket.data.combo = 0;
+  socket.data.jokerUtilise = false;
 
-  /* Rejoindre une salle */
-  socket.on('join-room', ({ room, name } = {}) => {
-    const r = String(room ?? '').trim().toLowerCase();
-    const n = String(name ?? '').trim().slice(0, 18);
+  /* ── Rejoindre une salle ────────────────────────────────── */
+  socket.on('join-room', (payload = {}) => {
+    const roomId = String(payload.roomId ?? '').trim().toLowerCase().slice(0, 24);
+    const playerName = String(payload.playerName ?? '').trim().slice(0, 18);
 
-    if (r.length < 2 || n.length < 2) {
-      socket.emit('join-error', { reason: 'Nom de salle ou prénom trop court.' });
+    if (roomId.length < 2 || playerName.length < 2) {
+      socket.emit('join-error', {
+        message: 'Nom de salle et prénom : 2 caractères minimum.',
+      });
       return;
     }
 
-    retirer(socket); // au cas où il était déjà ailleurs
+    quitterSalle(socket);
 
-    if (!salles.has(r)) salles.set(r, new Map());
-    const salle = salles.get(r);
+    const salle = getSalle(roomId);
 
-    if (salle.size >= MAX_JOUEURS) {
-      socket.emit('join-error', { reason: `La salle est pleine (${MAX_JOUEURS} orateurs).` });
+    if (salle.players.size >= MAX_JOUEURS) {
+      socket.emit('join-error', {
+        message: `La salle est complète (${MAX_JOUEURS} orateurs).`,
+      });
       return;
     }
 
-    salle.set(socket.id, { id: socket.id, name: n });
-    socket.data.room = r;
-    socket.data.name = n;
-    socket.join(r);
+    const dejaPris = Array.from(salle.players.values()).some(
+      (p) => p.name.toLowerCase() === playerName.toLowerCase()
+    );
+    if (dejaPris) {
+      socket.emit('join-error', {
+        message: 'Ce prénom est déjà utilisé dans cette salle.',
+      });
+      return;
+    }
 
-    console.log(`[entrée] ${n} rejoint ${r} (${salle.size}/${MAX_JOUEURS})`);
-    diffuserSalle(r);
+    salle.players.set(socket.id, {
+      id: socket.id,
+      name: playerName,
+      joinedAt: Date.now(),
+    });
+
+    socket.data.roomId = roomId;
+    socket.data.playerName = playerName;
+    socket.join(roomId);
+
+    console.log(`[entrée] ${playerName} → ${roomId} (${salle.players.size}/${MAX_JOUEURS})`);
+
+    socket.emit('join-success', { roomId, playerName });
+    diffuserSalle(io, roomId);
+
+    // Historique pour le nouvel arrivant
+    if (salle.arguments.length > 0) {
+      socket.emit('history', { arguments: salle.arguments.slice(-30) });
+    }
 
     // Annonce aux autres
-    socket.to(r).emit('power', {
-      type: 'challenge',
-      name: n,
-      message: `${n} entre dans l'arène.`,
+    socket.to(roomId).emit('defi-divin', {
+      player: playerName,
+      message: `${playerName} entre dans l'arène.`,
     });
   });
 
-  /* Quitter une salle */
-  socket.on('leave-room', () => retirer(socket));
+  /* ── Quitter volontairement ─────────────────────────────── */
+  socket.on('leave-room', () => quitterSalle(socket));
 
-  /* Argument parlé */
-  socket.on('argument', ({ text, durationMs } = {}) => {
-    const room = socket.data.room;
-    const name = socket.data.name;
-    if (!room || !text) return;
+  /* ── Prise de parole (audio simulé) ─────────────────────── */
+  socket.on('submit-audio', (payload = {}) => {
+    const roomId = socket.data.roomId;
+    const playerName = socket.data.playerName;
+    if (!roomId) return;
 
-    const paquet = {
+    const salle = salles.get(roomId);
+    if (!salle) return;
+
+    if (salle.players.size < MIN_JOUEURS) {
+      socket.emit('join-error', {
+        message: `Il faut ${MIN_JOUEURS} orateurs pour débattre.`,
+      });
+      return;
+    }
+
+    const argument = {
       id: `${socket.id}-${Date.now()}`,
-      name,
-      text: String(text).slice(0, 600),
-      durationMs: durationMs ?? 0,
+      player: playerName,
+      text: payload.text ? String(payload.text).slice(0, 600) : transcrire(),
+      durationMs: Number(payload.durationMs) || 0,
       at: Date.now(),
     };
 
-    // Uniquement aux autres : l'émetteur affiche déjà son message localement
-    socket.to(room).emit('argument', paquet);
-    console.log(`[argument] ${room} · ${name} : ${paquet.text.slice(0, 50)}…`);
+    salle.arguments.push(argument);
+    if (salle.arguments.length > 100) salle.arguments.shift();
+
+    io.to(roomId).emit('new-argument', argument);
+    console.log(`[argument] ${roomId} · ${playerName}`);
+
+    /* Combo Divin : 3 arguments consécutifs du même orateur */
+    const derniers = salle.arguments.slice(-3);
+    if (
+      derniers.length === 3 &&
+      derniers.every((a) => a.player === playerName)
+    ) {
+      io.to(roomId).emit('combo-divin', {
+        player: playerName,
+        count: 3,
+        message: `${playerName} enchaîne trois arguments sans faillir.`,
+      });
+      console.log(`[combo] ${roomId} · ${playerName}`);
+    }
+
+    /* Verdict automatique tous les 6 arguments */
+    if (salle.arguments.length > 0 && salle.arguments.length % 6 === 0) {
+      const verdict = rendreVerdict(roomId);
+      if (verdict) {
+        io.to(roomId).emit('verdict', verdict);
+        console.log(`[verdict] ${roomId} → ${verdict.winner}`);
+      }
+    }
   });
 
-  /* Pouvoirs : Défi Divin, Combo Divin, Appel aux Dieux */
-  socket.on('power', ({ type } = {}) => {
-    const room = socket.data.room;
-    const name = socket.data.name;
-    if (!room || !['challenge', 'combo', 'joker'].includes(type)) return;
+  /* ── Défi Divin ─────────────────────────────────────────── */
+  socket.on('defi-divin', () => {
+    const roomId = socket.data.roomId;
+    const playerName = socket.data.playerName;
+    if (!roomId) return;
 
-    const messages = {
-      challenge: `${name} défie l'arène. Qui répond ?`,
-      combo: `${name} enchaîne trois arguments d'affilée.`,
-      joker: `${name} invoque l'arbitrage de l'IA.`,
-    };
+    io.to(roomId).emit('defi-divin', {
+      player: playerName,
+      message: `${playerName} défie l'arène. Qui relève le gant ?`,
+    });
+  });
 
-    socket.to(room).emit('power', { type, name, message: messages[type] });
-    console.log(`[pouvoir] ${room} · ${name} → ${type}`);
+  /* ── Appel aux Dieux (Joker) ────────────────────────────── */
+  socket.on('joker-activated', () => {
+    const roomId = socket.data.roomId;
+    const playerName = socket.data.playerName;
+    if (!roomId) return;
+
+    if (socket.data.jokerUtilise) {
+      socket.emit('join-error', { message: 'Ton joker est déjà consumé.' });
+      return;
+    }
+    socket.data.jokerUtilise = true;
+
+    io.to(roomId).emit('joker-activated', {
+      player: playerName,
+      message: `${playerName} invoque l'arbitrage des Dieux.`,
+    });
+
+    // Le joker déclenche un verdict immédiat
+    const verdict = rendreVerdict(roomId);
+    if (verdict) {
+      setTimeout(() => io.to(roomId).emit('verdict', verdict), 1500);
+    }
+  });
+
+  /* ── Demande de verdict manuelle ────────────────────────── */
+  socket.on('request-verdict', () => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+    const verdict = rendreVerdict(roomId);
+    if (verdict) io.to(roomId).emit('verdict', verdict);
   });
 
   socket.on('disconnect', () => {
-    retirer(socket);
+    quitterSalle(socket);
     console.log(`[déconnexion] ${socket.id}`);
   });
 });
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`DebatIA backend en écoute sur le port ${PORT}`);
 });
